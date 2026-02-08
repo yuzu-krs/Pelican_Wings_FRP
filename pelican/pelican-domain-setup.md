@@ -18,6 +18,28 @@
 
 ---
 
+## クイックスタート（5分版・変数化）
+
+以下の変数に自環境の値を設定して読み替えてください。
+
+- `MC_DOMAIN`: 接続ドメイン（例: `mc.cloudru.jp`）
+- `VPS_PUBLIC_IP`: VPS のグローバル IP（例: `158.51.109.155`）
+- `FRP_TOKEN`: 強固な乱数トークン（非公開）
+- `PRIMARY_PORT`: 公開ポート（例: `25570`）
+- `ALLOW_RANGE`: 許可レンジ（例: `25565-26064` または `25500-25999`）
+- `LOCAL_WINGS_IP`: ローカル Wings IP（例: `192.168.110.6`）
+- `LOCAL_MC_PORT`: コンテナのローカル Minecraft ポート（例: `25565`/`25570`）
+
+手順の流れ（要点のみ）：
+
+1. Cloudflare DNS（DNS only）で `MC_DOMAIN → VPS_PUBLIC_IP` を設定。必要なら SRV でポートを隠す。
+2. VPS に `frps` を導入し、`bind_port=7000` と `allow_ports=ALLOW_RANGE` を設定。
+3. ローカル VM に `frpc` を導入し、`remote_port=PRIMARY_PORT` を `LOCAL_WINGS_IP:LOCAL_MC_PORT` へ転送。
+4. Pelican のノードに `0.0.0.0:ALLOW_RANGE` を Allocation。対象サーバへ `PRIMARY_PORT` を割り当て Primary に設定。
+5. 外部到達テスト `nc -vz MC_DOMAIN PRIMARY_PORT`、Minecraft クライアントで `MC_DOMAIN:PRIMARY_PORT` に接続。
+
+---
+
 ## 構成概要
 
 - Cloudflare DNS: `mc.cloudru.jp` を VPS の A レコードに向ける（Proxied: Off / DNS only）。
@@ -66,15 +88,12 @@ sudo mv frp_0.60.0_linux_amd64 frp
 [common]
 bind_port = 7000
 authentication_method = token
-token = <強固なランダム文字列>
-# セキュリティのため公開可能ポートを絞る（推奨）
-allow_ports = 25565,25568
-# 500ポートを事前開放する場合（例: 25500-25999）
-allow_ports = 25500-25999
-; 注: `allow_ports` は **許可範囲の指定** であり、frpc が該当 `remote_port` を持つプロキシを作成・接続したときだけ
-; frps 側にそのポートの待受が生成されます。範囲を指定しても frpc の定義がなければポートは自動では開きません。
-; 25565から500ポートを使う場合は以下のように変更可能
-; allow_ports = 25565-26064
+token = ${FRP_TOKEN}
+; 公開可能ポートを絞る（推奨）
+allow_ports = ${ALLOW_RANGE}
+; 例: 25565,25570 / 25500-25999 / 25565-26064
+; 注: allow_ports は "許可範囲" の指定であり、frpc が該当 remote_port を作成・接続したときだけ
+; frps 側に待受が生成されます。範囲指定だけでは自動公開されません。
 ```
 
 ### systemd ユニット `/etc/systemd/system/frps.service`
@@ -121,21 +140,20 @@ sudo mv frp_0.60.0_linux_amd64 frp
 
 ### 設定 `/etc/frp/frpc.ini`
 
-Minecraft の実ポートに合わせて `local_port` を設定します。標準なら 25565、現在 25568 を使っているなら 25568。
+Minecraft の実ポートに合わせて `LOCAL_MC_PORT` を設定します。
 
 ```ini
 [common]
-server_addr = 158.51.109.155
+server_addr = ${VPS_PUBLIC_IP}    ; または MC_DOMAIN（DNS only）
 server_port = 7000
 authentication_method = token
-token = <VPSと同じトークン>
+token = ${FRP_TOKEN}
 
-[minecraft]
+[minecraft-${PRIMARY_PORT}]
 type = tcp
-local_ip = 192.168.110.6
-local_port = 25565     # 25568 を使っているなら 25568 に変更
-remote_port = 25565    # VPS 側で公開したいポート
-; 許可範囲 25500-25999 から選択（例: 25565 や 25568 など）
+local_ip = ${LOCAL_WINGS_IP}
+local_port = ${LOCAL_MC_PORT}
+remote_port = ${PRIMARY_PORT}
 ```
 
 > 注意: `frpc` は「1セクション = 1公開ポート」です。単一の `[minecraft]` セクションでは範囲一括割当はできません。複数サーバを同時公開する場合は、ポートごとにセクションを追加するか、末尾の「10) 追加: frpc を使って 25500-25999 を一括公開する（自動生成）」のスクリプトで自動生成してください。
@@ -330,3 +348,22 @@ sudo ufw allow 25500:25999/udp
 - `frps` の `allow_ports = 25500-25999` に一致しないポートは公開されません。
 - ポート重複（同じ `remote_port` の二重定義）は失敗します。CSV で一意性を担保してください。
 - 生成後は `journalctl -u frpc -f` で接続状況を確認し、`ss -lntp`（TCP）/`ss -lnup`（UDP）で待受を確認します。
+
+---
+
+## 11) 運用チェックリスト（再現用）
+
+- Cloudflare: A レコードが DNS only、SRV の Target/Port が正しい
+- frps: `allow_ports` に公開したいポートが含まれる、`systemctl is-active frps` が active
+- frpc: `token` 一致、`remote_port` が意図した値、`systemctl is-active frpc` が active
+- Firewall: VPS で `PRIMARY_PORT/tcp` が許可されている
+- Pelican: ノードに `0.0.0.0` の割当があり、対象サーバに `PRIMARY_PORT` が割当＆Primary
+- コンテナ: サーバが Running、Address が `0.0.0.0:PRIMARY_PORT`（例: `0.0.0.0:25570`）
+
+---
+
+## 12) 検証例（成功パターン）
+
+- サーバ `mc02` を `PRIMARY_PORT=25570` で起動（Address: `0.0.0.0:25570`）。
+- 外部到達テスト: `nc -vz MC_DOMAIN 25570` → `succeeded`。
+- Minecraft クライアント: `MC_DOMAIN:25570` で入室可能。
